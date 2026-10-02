@@ -175,10 +175,25 @@ CREATE TABLE IF NOT EXISTS traffic_idempotency (
     scope TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     request_sha256 TEXT NOT NULL,
+    request_json TEXT,
     response_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY(scope, idempotency_key)
 );
+
+CREATE TABLE IF NOT EXISTS traffic_idempotency_conflicts (
+    conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    stored_request_sha256 TEXT NOT NULL,
+    incoming_request_sha256 TEXT NOT NULL,
+    diff_summary_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_idempotency_conflicts_key
+ON traffic_idempotency_conflicts(scope, idempotency_key, conflict_id);
 
 CREATE TABLE IF NOT EXISTS traffic_audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,7 +213,8 @@ ON traffic_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    # check_same_thread=False：HTTP 工作线程共享连接，由 api 层的锁串行化事务。
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
@@ -209,6 +225,12 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    # 旧版本数据库的 traffic_idempotency 没有 request_json 列，重启后需要补齐。
+    idempotency_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(traffic_idempotency)")
+    }
+    if "request_json" not in idempotency_columns:
+        connection.execute("ALTER TABLE traffic_idempotency ADD COLUMN request_json TEXT")
 
 
 @contextmanager

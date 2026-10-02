@@ -16,6 +16,14 @@ class Conflict(CollectionDispatchError):
     status = 409
 
 
+class IdempotencyConflict(Conflict):
+    code = "idempotency_conflict"
+
+    def __init__(self, message: str, *, conflict_id: int | None = None) -> None:
+        super().__init__(message)
+        self.conflict_id = conflict_id
+
+
 class Forbidden(CollectionDispatchError):
     code = "forbidden"
     status = 403

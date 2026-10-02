@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .errors import Conflict, Forbidden, IdempotencyConflict, InvalidState, NotFound, ValidationFailed
 from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
 from .planning import (
     AllocationRequest,
@@ -36,6 +36,29 @@ ROLE_PERMISSIONS = {
     "risk": {"outage.write", "scenario.approve", "report.read"},
     "auditor": {"report.read", "audit.read"},
 }
+
+
+def _request_diff(stored_json: str | None, incoming: Mapping[str, Any]) -> dict[str, Any]:
+    """比较已存请求与新请求，生成字段级差异摘要。"""
+    incoming_map = {str(key): value for key, value in incoming.items()}
+    if stored_json is None:
+        return {
+            "stored_request_available": False,
+            "changed_fields": [
+                {"field": key, "stored": None, "incoming": incoming_map[key]}
+                for key in sorted(incoming_map)
+            ],
+        }
+    stored_map = json.loads(stored_json)
+    changed_fields = []
+    for key in sorted(set(stored_map) | set(incoming_map)):
+        if key in stored_map and key in incoming_map:
+            if canonical_json(stored_map[key]) == canonical_json(incoming_map[key]):
+                continue
+        changed_fields.append(
+            {"field": key, "stored": stored_map.get(key), "incoming": incoming_map.get(key)}
+        )
+    return {"stored_request_available": True, "changed_fields": changed_fields}
 
 
 class CollectionLogisticsService:
@@ -301,49 +324,138 @@ class CollectionLogisticsService:
         self._require(actor_id, "dispatch_request.write")
         dispatch_request = DispatchRequest.from_dict(raw)
         request_digest = digest(raw)
-        stored = self.connection.execute(
-            "SELECT request_sha256,response_json FROM traffic_idempotency WHERE scope='dispatch_request' AND idempotency_key=?",
-            (dispatch_request.idempotency_key,),
-        ).fetchone()
-        if stored is not None:
-            if stored["request_sha256"] != request_digest:
-                raise Conflict("幂等键对应不同调度申请内容")
-            return json.loads(stored["response_json"])
-        route = self.route(dispatch_request.corridor_id)
-        if route["state"] != "active":
-            raise InvalidState("转运路线当前不可调度申请")
-        response = {
-            "dispatch_id": dispatch_request.dispatch_id,
-            "corridor_id": dispatch_request.corridor_id,
-            "state": "submitted",
-            "revision": 1,
-        }
+        # 整个交接在单个 BEGIN IMMEDIATE 事务内完成：写事务串行化后，
+        # 并发重试要么重放首次结果，要么登记冲突，不会出现重复执行记录。
+        outcome: tuple[str, Any] | None = None
         try:
             with transaction(self.connection, immediate=True):
-                self.connection.execute(
-                    "INSERT INTO dispatch_requests(dispatch_id,corridor_id,specimen_event_id,duty_date,requested_units,"
-                    "priority,idempotency_key,submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (
-                        dispatch_request.dispatch_id,
-                        dispatch_request.corridor_id,
-                        dispatch_request.specimen_event_id,
-                        dispatch_request.duty_date,
-                        decimal_text(dispatch_request.requested_units),
-                        dispatch_request.priority,
-                        dispatch_request.idempotency_key,
-                        actor_id,
-                        self._now(),
-                    ),
-                )
-                self.connection.execute(
-                    "INSERT INTO traffic_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
-                    "VALUES('dispatch_request',?,?,?,?)",
-                    (dispatch_request.idempotency_key, request_digest, canonical_json(response), self._now()),
-                )
-                self._audit("dispatch_request", dispatch_request.dispatch_id, "dispatch_request.submitted", actor_id, raw)
+                stored = self.connection.execute(
+                    "SELECT request_sha256,request_json,response_json FROM traffic_idempotency "
+                    "WHERE scope='dispatch_request' AND idempotency_key=?",
+                    (dispatch_request.idempotency_key,),
+                ).fetchone()
+                if stored is not None:
+                    if stored["request_sha256"] == request_digest:
+                        outcome = ("replay", json.loads(stored["response_json"]))
+                    else:
+                        outcome = (
+                            "conflict",
+                            self._record_idempotency_conflict(
+                                actor_id, dispatch_request.idempotency_key, stored, request_digest, raw
+                            ),
+                        )
+                else:
+                    route = self.route(dispatch_request.corridor_id)
+                    if route["state"] != "active":
+                        raise InvalidState("转运路线当前不可调度申请")
+                    response = {
+                        "dispatch_id": dispatch_request.dispatch_id,
+                        "corridor_id": dispatch_request.corridor_id,
+                        "state": "submitted",
+                        "revision": 1,
+                    }
+                    self.connection.execute(
+                        "INSERT INTO dispatch_requests(dispatch_id,corridor_id,specimen_event_id,duty_date,requested_units,"
+                        "priority,idempotency_key,submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (
+                            dispatch_request.dispatch_id,
+                            dispatch_request.corridor_id,
+                            dispatch_request.specimen_event_id,
+                            dispatch_request.duty_date,
+                            decimal_text(dispatch_request.requested_units),
+                            dispatch_request.priority,
+                            dispatch_request.idempotency_key,
+                            actor_id,
+                            self._now(),
+                        ),
+                    )
+                    self.connection.execute(
+                        "INSERT INTO traffic_idempotency(scope,idempotency_key,request_sha256,request_json,response_json,created_at) "
+                        "VALUES('dispatch_request',?,?,?,?,?)",
+                        (
+                            dispatch_request.idempotency_key,
+                            request_digest,
+                            canonical_json(dict(raw)),
+                            canonical_json(response),
+                            self._now(),
+                        ),
+                    )
+                    self._audit("dispatch_request", dispatch_request.dispatch_id, "dispatch_request.submitted", actor_id, raw)
+                    outcome = ("created", response)
         except sqlite3.IntegrityError as exc:
             raise Conflict("调度申请编号或幂等键冲突") from exc
-        return response
+        kind, value = outcome
+        if kind == "conflict":
+            raise IdempotencyConflict(
+                f"幂等键对应不同调度申请内容，已登记冲突记录 #{value['conflict_id']}",
+                conflict_id=value["conflict_id"],
+            )
+        return value
+
+    def _record_idempotency_conflict(
+        self,
+        actor_id: str,
+        idempotency_key: str,
+        stored: sqlite3.Row,
+        incoming_digest: str,
+        raw: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """在当前事务内登记冲突审计记录：差异摘要、请求方和时间。"""
+        diff_summary = _request_diff(stored["request_json"], raw)
+        cursor = self.connection.execute(
+            "INSERT INTO traffic_idempotency_conflicts(scope,idempotency_key,actor_id,stored_request_sha256,"
+            "incoming_request_sha256,diff_summary_json,created_at) VALUES('dispatch_request',?,?,?,?,?,?)",
+            (
+                idempotency_key,
+                actor_id,
+                stored["request_sha256"],
+                incoming_digest,
+                canonical_json(diff_summary),
+                self._now(),
+            ),
+        )
+        conflict_id = int(cursor.lastrowid)
+        self._audit(
+            "idempotency_conflict",
+            str(conflict_id),
+            "dispatch_request.idempotency_conflict",
+            actor_id,
+            {
+                "idempotency_key": idempotency_key,
+                "stored_request_sha256": stored["request_sha256"],
+                "incoming_request_sha256": incoming_digest,
+                "diff_summary": diff_summary,
+            },
+        )
+        return {"conflict_id": conflict_id, "idempotency_key": idempotency_key, "diff_summary": diff_summary}
+
+    def idempotency_conflicts(self, actor_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
+        self._require(actor_id, "audit.read")
+        if idempotency_key is None:
+            rows = self.connection.execute(
+                "SELECT * FROM traffic_idempotency_conflicts WHERE scope='dispatch_request' ORDER BY conflict_id"
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM traffic_idempotency_conflicts WHERE scope='dispatch_request' AND idempotency_key=? "
+                "ORDER BY conflict_id",
+                (idempotency_key,),
+            ).fetchall()
+        return {
+            "conflicts": [
+                {
+                    "conflict_id": row["conflict_id"],
+                    "scope": row["scope"],
+                    "idempotency_key": row["idempotency_key"],
+                    "actor_id": row["actor_id"],
+                    "stored_request_sha256": row["stored_request_sha256"],
+                    "incoming_request_sha256": row["incoming_request_sha256"],
+                    "diff_summary": json.loads(row["diff_summary_json"]),
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+        }
 
     def _capacity_for_date(self, route: sqlite3.Row, duty_date: str) -> Decimal:
         start = duty_date + "T00:00:00Z"
