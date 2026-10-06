@@ -223,6 +223,46 @@ class DispatchRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class HandoffRequest:
+    handoff_id: str
+    candidate_id: str
+    candidate_version: int
+    corridor_id: str
+    destination_center_id: str
+    preservation_resource_kind: str
+    requested_units: Decimal
+    priority: int
+    planned_date: str
+    idempotency_key: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "HandoffRequest":
+        candidate_version = raw.get("candidate_version")
+        if isinstance(candidate_version, bool) or not isinstance(candidate_version, int) or candidate_version <= 0:
+            raise ValidationFailed("candidate_version 必须是正整数")
+        priority = raw.get("priority", 100)
+        if isinstance(priority, bool) or not isinstance(priority, int) or not 1 <= priority <= 999:
+            raise ValidationFailed("priority 必须是 1 到 999 的整数")
+        preservation_resource_kind = required_text(raw.get("preservation_resource_kind"), "preservation_resource_kind", 32)
+        if preservation_resource_kind not in RESOURCE_KINDS:
+            raise ValidationFailed("preservation_resource_kind 不是受支持的电源类型")
+        return cls(
+            handoff_id=identifier(raw.get("handoff_id"), "handoff_id"),
+            candidate_id=identifier(raw.get("candidate_id"), "candidate_id"),
+            candidate_version=candidate_version,
+            corridor_id=identifier(raw.get("corridor_id"), "corridor_id"),
+            destination_center_id=identifier(raw.get("destination_center_id"), "destination_center_id"),
+            preservation_resource_kind=preservation_resource_kind,
+            requested_units=decimal_value(
+                raw.get("requested_units"), "requested_units", minimum=Decimal("0.001")
+            ),
+            priority=priority,
+            planned_date=date_text(raw.get("planned_date"), "planned_date"),
+            idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ResponseScenario:
     scenario_id: str
     name: str

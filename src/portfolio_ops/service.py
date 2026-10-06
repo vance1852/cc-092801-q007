@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .models import HandoffRequest, RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -31,11 +31,25 @@ from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"risk_record.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"dispatch_request.write", "allocation.run", "deployment.write", "inventory.write"},
+    "planner": {"risk_record.write", "catalog.write", "scenario.write", "scenario.run", "handoff.read"},
+    "dispatcher": {"dispatch_request.write", "allocation.run", "deployment.write", "inventory.write", "handoff.write", "handoff.read"},
     "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "handoff.read"},
 }
+
+HANDOFF_TASK_KINDS = ("intake-review", "execution-plan")
+
+
+def _request_diff(stored: Mapping[str, Any], received: Mapping[str, Any]) -> dict[str, Any]:
+    """逐字段比较已存请求与新请求，生成运营可读的差异摘要。"""
+
+    diff: dict[str, Any] = {}
+    for field in sorted(set(stored) | set(received)):
+        before = stored.get(field)
+        after = received.get(field)
+        if before != after:
+            diff[field] = {"stored": before, "received": after}
+    return diff
 
 
 class CollectionLogisticsService:
@@ -464,6 +478,222 @@ class CollectionLogisticsService:
             "expected_arrived_units": decimal_text(expected_delivery),
             "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(dispatch_request["response_minutes"]))),
         }
+
+    def _handoff_idempotency(self, idempotency_key: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM handoff_idempotency WHERE idempotency_key=?", (idempotency_key,)
+        ).fetchone()
+
+    def _record_handoff_conflict(
+        self,
+        actor_id: str,
+        request: HandoffRequest,
+        request_digest: str,
+        raw: Mapping[str, Any],
+        stored: sqlite3.Row,
+    ) -> int:
+        diff = _request_diff(json.loads(stored["request_json"]), dict(raw))
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO handoff_conflicts(idempotency_key,handoff_id,candidate_id,request_sha256,stored_sha256,"
+                "diff_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    request.idempotency_key,
+                    stored["handoff_id"],
+                    request.candidate_id,
+                    request_digest,
+                    stored["request_sha256"],
+                    canonical_json(diff),
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            conflict_id = int(cursor.lastrowid)
+            self._audit(
+                "handoff",
+                stored["handoff_id"],
+                "handoff.conflict",
+                actor_id,
+                {"conflict_id": conflict_id, "idempotency_key": request.idempotency_key, "diff": diff},
+            )
+        return conflict_id
+
+    def submit_handoff(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "handoff.write")
+        request = HandoffRequest.from_dict(raw)
+        request_digest = digest(dict(raw))
+        stored = self._handoff_idempotency(request.idempotency_key)
+        if stored is not None:
+            if stored["request_sha256"] == request_digest:
+                return json.loads(stored["response_json"])
+            conflict_id = self._record_handoff_conflict(actor_id, request, request_digest, raw, stored)
+            raise Conflict(f"幂等键对应不同交接内容，已登记冲突记录 {conflict_id}")
+        route = self.route(request.corridor_id)
+        if route["state"] != "active":
+            raise InvalidState("尽调通道当前不可接收交接")
+        if self.connection.execute(
+            "SELECT 1 FROM response_centers WHERE center_id=?", (request.destination_center_id,)
+        ).fetchone() is None:
+            raise NotFound("接收中心不存在")
+        now = self._now()
+        tasks = [
+            {"task_id": f"{request.handoff_id}:{kind}", "kind": kind, "state": "pending"}
+            for kind in HANDOFF_TASK_KINDS
+        ]
+        reservation = {
+            "reservation_id": f"{request.handoff_id}:reservation",
+            "center_id": request.destination_center_id,
+            "preservation_resource_kind": request.preservation_resource_kind,
+            "reserved_units": decimal_text(request.requested_units),
+            "state": "reserved",
+        }
+        response = {
+            "handoff_id": request.handoff_id,
+            "candidate_id": request.candidate_id,
+            "candidate_version": request.candidate_version,
+            "corridor_id": request.corridor_id,
+            "destination_center_id": request.destination_center_id,
+            "state": "accepted",
+            "requested_units": decimal_text(request.requested_units),
+            "priority": request.priority,
+            "planned_date": request.planned_date,
+            "tasks": tasks,
+            "reservation": reservation,
+            "request_sha256": request_digest,
+            "submitted_by": actor_id,
+            "submitted_at": now,
+        }
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO handoffs(handoff_id,candidate_id,candidate_version,corridor_id,destination_center_id,"
+                    "preservation_resource_kind,requested_units,priority,planned_date,idempotency_key,state,"
+                    "submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?,?,?,'accepted',?,?)",
+                    (
+                        request.handoff_id,
+                        request.candidate_id,
+                        request.candidate_version,
+                        request.corridor_id,
+                        request.destination_center_id,
+                        request.preservation_resource_kind,
+                        decimal_text(request.requested_units),
+                        request.priority,
+                        request.planned_date,
+                        request.idempotency_key,
+                        actor_id,
+                        now,
+                    ),
+                )
+                for task in tasks:
+                    self.connection.execute(
+                        "INSERT INTO handoff_tasks(task_id,handoff_id,kind,state,created_at) VALUES(?,?,?,?,?)",
+                        (task["task_id"], request.handoff_id, task["kind"], task["state"], now),
+                    )
+                self.connection.execute(
+                    "INSERT INTO resource_reservations(reservation_id,handoff_id,center_id,preservation_resource_kind,"
+                    "reserved_units,state,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        reservation["reservation_id"],
+                        request.handoff_id,
+                        reservation["center_id"],
+                        reservation["preservation_resource_kind"],
+                        reservation["reserved_units"],
+                        reservation["state"],
+                        now,
+                    ),
+                )
+                self.connection.execute(
+                    "INSERT INTO handoff_idempotency(idempotency_key,handoff_id,request_sha256,request_json,"
+                    "response_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        request.idempotency_key,
+                        request.handoff_id,
+                        request_digest,
+                        canonical_json(dict(raw)),
+                        canonical_json(response),
+                        actor_id,
+                        now,
+                    ),
+                )
+                self._audit(
+                    "handoff",
+                    request.handoff_id,
+                    "handoff.accepted",
+                    actor_id,
+                    {
+                        "candidate_id": request.candidate_id,
+                        "candidate_version": request.candidate_version,
+                        "idempotency_key": request.idempotency_key,
+                        "request_sha256": request_digest,
+                    },
+                )
+        except sqlite3.IntegrityError:
+            raced = self._handoff_idempotency(request.idempotency_key)
+            if raced is None:
+                raise Conflict("交接编号或幂等键冲突")
+            if raced["request_sha256"] == request_digest:
+                return json.loads(raced["response_json"])
+            conflict_id = self._record_handoff_conflict(actor_id, request, request_digest, raw, raced)
+            raise Conflict(f"幂等键对应不同交接内容，已登记冲突记录 {conflict_id}")
+        return response
+
+    def handoff(self, actor_id: str, handoff_id: str) -> dict[str, Any]:
+        self._require(actor_id, "handoff.read")
+        row = self.connection.execute("SELECT * FROM handoffs WHERE handoff_id=?", (handoff_id,)).fetchone()
+        if row is None:
+            raise NotFound("交接单不存在")
+        tasks = self.connection.execute(
+            "SELECT * FROM handoff_tasks WHERE handoff_id=? ORDER BY task_id", (handoff_id,)
+        ).fetchall()
+        reservation = self.connection.execute(
+            "SELECT * FROM resource_reservations WHERE handoff_id=?", (handoff_id,)
+        ).fetchone()
+        return {
+            "handoff": dict(row),
+            "tasks": [dict(task) for task in tasks],
+            "reservation": None if reservation is None else dict(reservation),
+        }
+
+    @staticmethod
+    def _conflict_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "conflict_id": row["conflict_id"],
+            "idempotency_key": row["idempotency_key"],
+            "handoff_id": row["handoff_id"],
+            "candidate_id": row["candidate_id"],
+            "request_sha256": row["request_sha256"],
+            "stored_sha256": row["stored_sha256"],
+            "diff": json.loads(row["diff_json"]),
+            "actor_id": row["actor_id"],
+            "created_at": row["created_at"],
+        }
+
+    def handoff_conflicts(
+        self, actor_id: str, idempotency_key: str | None = None, candidate_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        self._require(actor_id, "handoff.read")
+        clauses: list[str] = []
+        args: list[str] = []
+        if idempotency_key:
+            clauses.append("idempotency_key=?")
+            args.append(idempotency_key)
+        if candidate_id:
+            clauses.append("candidate_id=?")
+            args.append(candidate_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.connection.execute(
+            f"SELECT * FROM handoff_conflicts{where} ORDER BY conflict_id", args
+        ).fetchall()
+        return [self._conflict_dict(row) for row in rows]
+
+    def handoff_conflict(self, actor_id: str, conflict_id: int) -> dict[str, Any]:
+        self._require(actor_id, "handoff.read")
+        row = self.connection.execute(
+            "SELECT * FROM handoff_conflicts WHERE conflict_id=?", (conflict_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("冲突记录不存在")
+        return self._conflict_dict(row)
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "scenario.write")

@@ -171,6 +171,69 @@ CREATE TABLE IF NOT EXISTS response_scenario_runs (
     UNIQUE(scenario_id, as_of_date, input_sha256)
 );
 
+CREATE TABLE IF NOT EXISTS handoffs (
+    handoff_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    candidate_version INTEGER NOT NULL CHECK(candidate_version > 0),
+    corridor_id TEXT NOT NULL REFERENCES road_corridors(corridor_id),
+    destination_center_id TEXT NOT NULL REFERENCES response_centers(center_id),
+    preservation_resource_kind TEXT NOT NULL,
+    requested_units TEXT NOT NULL,
+    priority INTEGER NOT NULL,
+    planned_date TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL DEFAULT 'accepted' CHECK(state IN ('accepted','cancelled')),
+    submitted_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    submitted_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_handoffs_candidate
+ON handoffs(candidate_id, candidate_version, handoff_id);
+
+CREATE TABLE IF NOT EXISTS handoff_tasks (
+    task_id TEXT PRIMARY KEY,
+    handoff_id TEXT NOT NULL REFERENCES handoffs(handoff_id),
+    kind TEXT NOT NULL CHECK(kind IN ('intake-review','execution-plan')),
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','in_progress','done','cancelled')),
+    created_at TEXT NOT NULL,
+    UNIQUE(handoff_id, kind)
+);
+
+CREATE TABLE IF NOT EXISTS resource_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    handoff_id TEXT NOT NULL UNIQUE REFERENCES handoffs(handoff_id),
+    center_id TEXT NOT NULL REFERENCES response_centers(center_id),
+    preservation_resource_kind TEXT NOT NULL,
+    reserved_units TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'reserved' CHECK(state IN ('reserved','released','consumed')),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS handoff_idempotency (
+    idempotency_key TEXT PRIMARY KEY,
+    handoff_id TEXT NOT NULL REFERENCES handoffs(handoff_id),
+    request_sha256 TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS handoff_conflicts (
+    conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL,
+    handoff_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    stored_sha256 TEXT NOT NULL,
+    diff_json TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_handoff_conflicts_key
+ON handoff_conflicts(idempotency_key, conflict_id);
+
 CREATE TABLE IF NOT EXISTS traffic_idempotency (
     scope TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
@@ -198,7 +261,7 @@ ON traffic_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

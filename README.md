@@ -47,3 +47,13 @@ PYTHONPATH=src python3 -m licensing_ops.api --database licensing.sqlite3 --host 
 ~~~
 
 服务提供浏览器无关的 JSON 接口和健康检查。进程重启后可以继续读取 SQLite 中的业务状态与审计历史。
+
+## 交接幂等控制
+
+候选项目从发现评估交接到组合执行时，调用方在 `POST /handoffs` 提交候选项目、版本与关键参数并携带幂等键：
+
+- 首次请求在单个 SQLite 事务中创建交接单、执行任务、资源预留与审计事件；
+- 完全相同的重试返回首次保存的结果，不重复产生任务、资源预留或审计事件，进程重启后仍然有效；
+- 同一幂等键对应不同候选项目、版本或关键参数时返回 409，并把包含字段级差异摘要、请求方和时间的冲突记录写入 `handoff_conflicts` 表与审计链。
+
+运营人员可通过 `GET /handoffs/{handoff_id}` 查看交接结果，通过 `GET /handoff_conflicts`（支持 `idempotency_key`、`candidate_id` 过滤）或 `GET /handoff_conflicts/{conflict_id}` 查询冲突记录。

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,12 @@ class Response:
 class JsonApplication:
     def __init__(self, service: CollectionLogisticsService) -> None:
         self.service = service
+        self._lock = threading.Lock()
+
+    def handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
+        # 服务在单个 SQLite 连接上运行,串行化处理多线程请求以保持事务一致性。
+        with self._lock:
+            return self._dispatch(method, target, headers, body)
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -44,7 +51,7 @@ class JsonApplication:
             raise ValidationFailed("请求体必须是 JSON 对象")
         return value
 
-    def handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
+    def _dispatch(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
         normalized = {key.lower(): value for key, value in (headers or {}).items()}
         parsed = urlparse(target)
         path = parsed.path.rstrip("/") or "/"
@@ -77,6 +84,14 @@ class JsonApplication:
                 return Response(200, self.service.allocate(actor, parts[1], payload["duty_date"]))
             if method == "POST" and path == "/deployments":
                 return Response(201, self.service.dispatch_deployment(actor, payload["deployment_id"], payload["dispatch_id"], payload["preservation_resource_lot_id"], int(payload["expected_revision"])))
+            if method == "POST" and path == "/handoffs":
+                return Response(201, self.service.submit_handoff(actor, payload))
+            if method == "GET" and len(parts) == 2 and parts[0] == "handoffs":
+                return Response(200, self.service.handoff(actor, parts[1]))
+            if method == "GET" and path == "/handoff_conflicts":
+                return Response(200, {"conflicts": self.service.handoff_conflicts(actor, query.get("idempotency_key", [None])[0], query.get("candidate_id", [None])[0])})
+            if method == "GET" and len(parts) == 2 and parts[0] == "handoff_conflicts":
+                return Response(200, self.service.handoff_conflict(actor, int(parts[1])))
             if method == "POST" and path == "/scenarios":
                 return Response(201, self.service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":
